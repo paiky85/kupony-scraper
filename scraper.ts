@@ -14,59 +14,79 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
 // Kolik obchodů spojit do JEDNOHO volání Gemini (šetří 80 % denního limitu volání)
 const BATCH_SIZE = 5;
 
-// Seznam modelů od nejlepšího po záložní s nejvyššími limity
-// Pokud první model hodí 503 (přetíženo) nebo 429 (limit), skript automaticky zkusí další
+// Seznam modelů s automatickým přepínáním (Fallback)
 const MODELS_FALLBACK = [
   'gemini-4-hydrogen',
   'gemini-3.8-flash',
   'gemini-3.8-flash-lite'
 ];
 
-// 2. Schéma výstupu pro dávku obchodů (každý kupón má přiřazené store_id)
+// Povolené typy slev přesně podle CHECK constraintu v databázi
+const NUMERIC_DISCOUNT_TYPES = ['procento', 'CZK', 'EUR', 'USD', 'PLN', 'GBP', 'HUF'];
+const NULL_VALUE_DISCOUNT_TYPES = ['doprava_zdarma', 'darek', 'akce_1plus1', 'jina_akce'];
+const ALL_DISCOUNT_TYPES = [...NUMERIC_DISCOUNT_TYPES, ...NULL_VALUE_DISCOUNT_TYPES];
+
+// 2. Schéma výstupu pro dávku obchodů
 const batchCouponResponseSchema: Schema = {
   type: Type.ARRAY,
   description: 'Seznam nalezených slevových kupónů ze všech kontrolovaných obchodů v dávce.',
   items: {
     type: Type.OBJECT,
     properties: {
-      store_id: {
+      store_key: {
         type: Type.STRING,
-        description: 'Přesné ID obchodu (STORE_ID), ke kterému tento kupón patří.'
+        description: 'Přesný klíč obchodu (STORE_KEY) z hlavičky, např. "chia-shake|CZ".'
       },
       kod: {
         type: Type.STRING,
-        description: 'Slevový kód (např. SLEVA20). Vždy velkými písmeny bez mezer.'
+        description: 'Slevový kód (např. BF15CZ). Vždy velkými písmeny bez mezer.'
+      },
+      nadpis: {
+        type: Type.STRING,
+        description: 'Stručný a jasný hlavní název akce (např. "Black Friday sleva 15 % na vše" nebo "Doprava zdarma nad 1 000 Kč").'
+      },
+      sleva_typ: {
+        type: Type.STRING,
+        enum: ALL_DISCOUNT_TYPES,
+        description: 'Typ slevy: "procento" pro % slevy, kód měny ("CZK", "EUR", "PLN"...) pro peněžní slevy, nebo "doprava_zdarma", "darek", "akce_1plus1", "jina_akce".'
+      },
+      sleva_hodnota: {
+        type: Type.NUMBER,
+        description: 'Číselná hodnota slevy (např. 15 pro 15 %, nebo 200 pro 200 Kč). Pokud je sleva_typ doprava_zdarma, darek, akce_1plus1 nebo jina_akce, vrať 0.'
       },
       popis: {
         type: Type.STRING,
-        description: 'Stručný název/popis slevy (např. Sleva 20 % na vše).'
+        description: 'Doplňující podmínky uplatnění (např. minimální hodnota nákupu, výjimky na zlevněné zboží, zda platí jen pro nové zákazníky/newsletter). Pokud žádné další podmínky nejsou, nech prázdný řetězec.'
       },
-      sleva_hodnota: {
+      raw_text_z_webu: {
         type: Type.STRING,
-        description: 'Hodnota slevy (např. "20 %", "200 Kč", "Doprava zdarma").'
+        description: 'Doslovný text z banneru nebo stránky, ze kterého byl kupón vyčten (pro kontrolu v administraci).'
       },
-      podminky: {
-        type: Type.STRING,
-        description: 'Detailní podmínky uplatnění (minimální objednávka, výjimky, na jaké produkty platí).'
-      },
-      platnost_od: {
+      plati_od: {
         type: Type.STRING,
         description: 'Datum začátku platnosti YYYY-MM-DD (pokud je uvedeno, jinak prázdný řetězec).'
       },
-      platnost_do: {
+      plati_do: {
         type: Type.STRING,
-        description: 'Datum konce platnosti YYYY-MM-DD (přepočítej i z odpočtů, jinak prázdný řetězec).'
+        description: 'Datum konce platnosti YYYY-MM-DD (přepočítej i z odpočtů typu "končí za 2 dny", jinak prázdný řetězec).'
       },
-      pro_nove_zakazniky: {
-        type: Type.BOOLEAN,
-        description: 'True, pokud jde o kód pouze na první nákup nebo za newsletter.'
-      },
-      zdroj_url: {
+      cilova_url: {
         type: Type.STRING,
-        description: 'URL adresa, kde byl kód nalezen.'
+        description: 'URL adresa stránky nebo podstránky, kde byl kód nalezen.'
       }
     },
-    required: ['store_id', 'kod', 'popis', 'sleva_hodnota', 'podminky', 'pro_nove_zakazniky', 'zdroj_url']
+    required: [
+      'store_key',
+      'kod',
+      'nadpis',
+      'sleva_typ',
+      'sleva_hodnota',
+      'popis',
+      'raw_text_z_webu',
+      'plati_od',
+      'plati_do',
+      'cilova_url'
+    ]
   }
 };
 
@@ -85,7 +105,8 @@ async function scrapePageData(page: Page, url: string, takeScreenshot = false): 
         'button:has-text("Povolit")',
         'a:has-text("Rozumím")',
         '#cookiescript_accept',
-        '.c-button--accept'
+        '.c-button--accept',
+        '[data-testid="uc-accept-all-button"]'
       ];
       for (const sel of cookieSelectors) {
         const btn = page.locator(sel).first();
@@ -119,7 +140,6 @@ async function scrapePageData(page: Page, url: string, takeScreenshot = false): 
     const extractedData = await page.evaluate(() => {
       const visibleText = document.body.innerText || '';
 
-      // Horní lišty a bannery
       const topBarTexts: string[] = [];
       document.querySelectorAll('header, [class*="top"], [class*="bar"], [class*="strip"], [class*="ribbon"], [class*="info"], [class*="promo"], [class*="banner"], [id*="bar"], [id*="top"]').forEach((el) => {
         const t = el.textContent?.replace(/\s+/g, ' ').trim();
@@ -128,7 +148,6 @@ async function scrapePageData(page: Page, url: string, takeScreenshot = false): 
         }
       });
 
-      // Popisky obrázků (alt, title)
       const imageTexts: string[] = [];
       document.querySelectorAll('img, picture, [role="img"], a').forEach((el) => {
         const alt = el.getAttribute('alt');
@@ -153,7 +172,7 @@ async function scrapePageData(page: Page, url: string, takeScreenshot = false): 
     });
 
     if (takeScreenshot) {
-      console.log(`   🔝 Horní lišty na webu: ${extractedData.topBarsPreview.slice(0, 350)}`);
+      console.log(`   🔝 Horní lišty na webu: ${extractedData.topBarsPreview.slice(0, 300)}`);
     }
 
     return {
@@ -166,7 +185,42 @@ async function scrapePageData(page: Page, url: string, takeScreenshot = false): 
   }
 }
 
-// 4. Volání Gemini s automatickým přepínáním modelů a opakováním při 503/429
+// 4. Automatické nalezení podstránek se slevami v menu/patičce
+async function findPromoSubpages(page: Page, baseUrl: string): Promise<string[]> {
+  try {
+    const baseHost = new URL(baseUrl).hostname;
+    const links = await page.evaluate(() => {
+      return Array.from(document.querySelectorAll('a[href]')).map((a) => ({
+        href: (a as HTMLAnchorElement).href,
+        text: (a.textContent || '').toLowerCase()
+      }));
+    });
+
+    const keywords = [
+      'kupon', 'kupón', 'slevov', 'voucher', 'akce', 'akcni', 'akční',
+      'vyprodej', 'výprodej', 'black-friday', 'slevy', 'promo', 'kod', 'kód'
+    ];
+
+    const foundUrls = new Set<string>();
+    for (const link of links) {
+      try {
+        const u = new URL(link.href);
+        if (u.hostname === baseHost && u.pathname !== '/' && !u.pathname.match(/\.(jpg|png|pdf|xml)$/i)) {
+          const combined = (u.pathname + ' ' + link.text).toLowerCase();
+          if (keywords.some((kw) => combined.includes(kw))) {
+            foundUrls.add(u.origin + u.pathname);
+          }
+        }
+      } catch {}
+    }
+
+    return Array.from(foundUrls).slice(0, 2);
+  } catch {
+    return [];
+  }
+}
+
+// 5. Volání Gemini s automatickým přepínáním modelů a opakováním při 503/429
 async function callGeminiWithFallback(contentsParts: any[]): Promise<any[]> {
   for (const modelName of MODELS_FALLBACK) {
     for (let attempt = 1; attempt <= 3; attempt++) {
@@ -186,10 +240,8 @@ async function callGeminiWithFallback(contentsParts: any[]): Promise<any[]> {
         console.warn(`   ⚠️ Model ${modelName} (pokus ${attempt}/3) vrátil chybu ${status}: ${err?.message?.slice(0, 120)}`);
 
         if (status === 503 || status === 429) {
-          // Počkáme 12 vteřin a zkusíme znovu
           await new Promise((r) => setTimeout(r, 12000));
         } else {
-          // Pokud model neexistuje (404), jdeme rovnou na další model v seznamu
           break;
         }
       }
@@ -198,7 +250,7 @@ async function callGeminiWithFallback(contentsParts: any[]): Promise<any[]> {
   throw new Error('Všechny modely Gemini selhaly nebo jsou dočasně nedostupné.');
 }
 
-// 5. Hlavní funkce sběrače
+// 6. Hlavní funkce sběrače
 async function runScraper() {
   const today = new Date().toISOString().split('T')[0];
   console.log(`🚀 Spouštím dávkový sběrač kupónů (${today})...`);
@@ -228,9 +280,9 @@ async function runScraper() {
     }
   });
 
-  // FÁZE 1: Stažení dat z webů a filtrace změn
   interface PreparedStore {
     store: any;
+    storeKey: string; // např. "chia-shake|CZ"
     combinedContent: string;
     screenshotBase64?: string;
     currentHash: string;
@@ -239,7 +291,8 @@ async function runScraper() {
   const storesForAi: PreparedStore[] = [];
 
   for (const store of stores) {
-    const storeLabel = store.obchod_slug || store.nazev || store.webova_adresa;
+    const storeKey = `${store.obchod_id}|${store.kod_zeme}`;
+    const storeLabel = `${store.lokalni_nazev || store.obchod_id} (${store.kod_zeme})`;
 
     if (store.preskocit_kontrolu_do && store.preskocit_kontrolu_do > today) {
       console.log(`⏭️ Přeskakuji ${storeLabel} - chytrá pauza do ${store.preskocit_kontrolu_do}`);
@@ -251,18 +304,32 @@ async function runScraper() {
 
     try {
       const mainData = await scrapePageData(page, store.webova_adresa, true);
-      const combinedContent = mainData.text;
+      let combinedContent = mainData.text;
+
+      // Kontrola případných podstránek (max 2 automatické + ručně zadané v dalsi_url_ke_kontrole)
+      const autoSubpages = await findPromoSubpages(page, store.webova_adresa);
+      const manualSubpages: string[] = Array.isArray(store.dalsi_url_ke_kontrole) ? store.dalsi_url_ke_kontrole : [];
+      const allSubpages = Array.from(new Set([...manualSubpages, ...autoSubpages])).slice(0, 3);
+
+      for (const subUrl of allSubpages) {
+        console.log(`   ↳ Procházím podstránku: ${subUrl}`);
+        const subData = await scrapePageData(page, subUrl, false);
+        combinedContent += subData.text;
+      }
+
       const currentHash = crypto.createHash('md5').update(combinedContent).digest('hex');
 
       if (store.posledni_hash_obsahu === currentHash) {
         console.log(`   🟰 Obsah webu se od minula nezměnil, šetřím AI limit.`);
         await supabase
           .from('obchody_trhy')
-          .update({ posledni_kontrola_webu: new Date().toISOString() })
-          .eq('id', store.id);
+          .update({ posledni_kontrola_at: new Date().toISOString() })
+          .eq('obchod_id', store.obchod_id)
+          .eq('kod_zeme', store.kod_zeme);
       } else {
         storesForAi.push({
           store,
+          storeKey,
           combinedContent,
           screenshotBase64: mainData.screenshotBase64,
           currentHash
@@ -282,7 +349,6 @@ async function runScraper() {
     return;
   }
 
-  // FÁZE 2: Zpracování přes Gemini po dávkách (BATCH_SIZE obchodů v 1 dotazu)
   console.log(`🧠 Posílám ${storesForAi.length} obchodů do Gemini v dávkách po ${BATCH_SIZE}...`);
 
   for (let i = 0; i < storesForAi.length; i += BATCH_SIZE) {
@@ -290,24 +356,25 @@ async function runScraper() {
     console.log(`\n📦 Zpracovávám dávku ${Math.floor(i / BATCH_SIZE) + 1} (${batch.length} obchodů)...`);
 
     const contentsParts: any[] = [];
-    let batchPrompt = `
+    const batchPrompt = `
       Jsi expert na extrakci slevových kupónů z e-shopů. Dnešní datum je ${today}.
       Níže dostaneš data a screenshoty pro ${batch.length} různých e-shopů.
       Pro každý e-shop pozorně prohlédni jeho SCREENSHOT (zejména úplně horní barevnou lištu nad menu a hlavní grafický banner!) a vytažený text.
       
       PŘÍSNÁ PRAVIDLA:
       1. Najdi VŠECHNY platné slevové kupóny, které obsahují konkrétní slevový kód pro zadání v košíku.
-      2. U každého nalezeného kupónu MUSÍŠ vyplnit přesné "store_id" obchodu, ke kterému patří.
-      3. Ignoruj běžné slevy bez kódu. Nikdy si kódy nevymýšlej.
-      4. Pokud je u kupónu odpočet nebo datum konce akce, přepočítej ho od dnešního data (${today}) na formát YYYY-MM-DD do pole platnost_do.
+      2. U každého nalezeného kupónu MUSÍŠ vyplnit přesný "store_key" obchodu z hlavičky OBCHOD STORE_KEY (např. "chia-shake|CZ").
+      3. Pole "nadpis" musí být stručný a výstižný název slevy (např. "Black Friday sleva 15 % na vše").
+      4. Pole "popis" obsahuje pouze doplňující podmínky (např. "Platí při nákupu nad 1 000 Kč." nebo "Platí pro nové zákazníky."). Pokud žádné speciální podmínky nejsou, nech "popis" jako prázdný řetězec "".
+      5. Pro procentuální slevu nastav sleva_typ="procento" a sleva_hodnota=číslo (např. 15). Pro peněžní slevu nastav sleva_typ podle měny obchodu ("CZK", "EUR"...) a sleva_hodnota=částka. Pro dopravu zdarma, dárek nebo 1+1 nastav příslušný sleva_typ a sleva_hodnota=0.
+      6. Pokud je u kupónu odpočet nebo datum konce akce, přepočítej ho od dnešního data (${today}) na formát YYYY-MM-DD do pole plati_do.
     `;
 
     contentsParts.push({ text: batchPrompt });
 
     for (const item of batch) {
-      const s = item.store;
       contentsParts.push({
-        text: `\n========================================\nOBCHOD STORE_ID: "${s.id}" (URL: ${s.webova_adresa})\n========================================\n${item.combinedContent.slice(0, 25000)}`
+        text: `\n========================================\nOBCHOD STORE_KEY: "${item.storeKey}" (Název: ${item.store.lokalni_nazev}, Měna obchodu: ${item.store.mena || 'CZK'}, URL: ${item.store.webova_adresa})\n========================================\n${item.combinedContent.slice(0, 25000)}`
       });
       if (item.screenshotBase64) {
         contentsParts.push({
@@ -323,71 +390,101 @@ async function runScraper() {
       const foundCoupons = await callGeminiWithFallback(contentsParts);
       console.log(`   🤖 Gemini v této dávce nalezlo celkem ${foundCoupons.length} kupónů:`, JSON.stringify(foundCoupons));
 
-      // Rozřadíme nalezené kupóny k jednotlivým obchodům v dávce
       for (const item of batch) {
         const s = item.store;
-        const storeCoupons = foundCoupons.filter((c: any) => String(c.store_id) === String(s.id));
+        const storeCoupons = batch.length === 1
+          ? foundCoupons
+          : foundCoupons.filter((c: any) => String(c.store_key) === item.storeKey);
+
         let latestExpiration: string | null = null;
 
         for (const coupon of storeCoupons) {
           const cleanCode = coupon.kod.trim().toUpperCase();
 
+          // 1. Kontrola duplicity v ostré tabulce "kupony"
           const { data: existingApproved } = await supabase
             .from('kupony')
             .select('id')
-            .eq('obchod_trh_id', s.id)
+            .eq('obchod_id', s.obchod_id)
+            .eq('kod_zeme', s.kod_zeme)
             .ilike('kod', cleanCode)
+            .is('smazano_at', null)
             .maybeSingle();
 
+          // 2. Kontrola duplicity v čekací tabulce "kupony_ke_schvaleni"
           const { data: existingQueue } = await supabase
             .from('kupony_ke_schvaleni')
             .select('id')
-            .eq('obchod_trh_id', s.id)
+            .eq('obchod_id', s.obchod_id)
+            .eq('kod_zeme', s.kod_zeme)
             .ilike('kod', cleanCode)
             .maybeSingle();
 
           if (!existingApproved && !existingQueue) {
-            const { error: insertErr } = await supabase.from('kupony_ke_schvaleni').insert({
-              obchod_trh_id: s.id,
+            // Ošetření CHECK constraintu check_inbox_sleva_logika:
+            let slevaTyp = ALL_DISCOUNT_TYPES.includes(coupon.sleva_typ) ? coupon.sleva_typ : 'jina_akce';
+            let slevaHodnota: number | null = null;
+
+            if (NUMERIC_DISCOUNT_TYPES.includes(slevaTyp)) {
+              const numVal = Number(coupon.sleva_hodnota);
+              if (!isNaN(numVal) && numVal > 0) {
+                slevaHodnota = numVal;
+              } else {
+                // Pokud AI vrátila 0 nebo nečíselnou hodnotu u procenta/měny, přepneme na jina_akce s NULL
+                slevaTyp = 'jina_akce';
+                slevaHodnota = null;
+              }
+            } else {
+              // Pro doprava_zdarma, darek, akce_1plus1, jina_akce MUSÍ být sleva_hodnota NULL
+              slevaHodnota = null;
+            }
+
+            const payload = {
+              obchod_id: s.obchod_id,
+              kod_zeme: s.kod_zeme,
               kod: cleanCode,
-              popis: coupon.popis,
-              sleva_hodnota: coupon.sleva_hodnota,
-              podminky: coupon.podminky,
-              platnost_od: coupon.platnost_od || null,
-              platnost_do: coupon.platnost_do || null,
-              pro_nove_zakazniky: coupon.pro_nove_zakazniky,
-              zdroj_typ: 'automat_web',
-              zdroj_info: coupon.zdroj_url || s.webova_adresa,
-              ai_jistota: 95,
+              nadpis: coupon.nadpis || `Slevový kód ${cleanCode}`,
+              sleva_hodnota: slevaHodnota,
+              sleva_typ: slevaTyp,
+              popis: coupon.popis && coupon.popis.trim().length > 0 ? coupon.popis.trim() : null,
+              plati_od: coupon.plati_od && coupon.plati_od.length === 10 ? coupon.plati_od : null,
+              plati_do: coupon.plati_do && coupon.plati_do.length === 10 ? coupon.plati_do : null,
+              cilova_url: coupon.cilova_url || s.webova_adresa,
+              zdroj: 'automat_web',
               stav: 'ceka',
-              surova_data: coupon
-            });
+              raw_data: coupon
+            };
+
+            const { error: insertErr } = await supabase
+              .from('kupony_ke_schvaleni')
+              .insert(payload);
+
             if (insertErr) {
               console.error(`   ❌ Chyba zápisu do DB u kódu ${cleanCode}:`, insertErr);
             } else {
-              console.log(`   ✅ Uložen nový kupón ke schválení: ${cleanCode} (${coupon.sleva_hodnota})`);
+              console.log(`   ✅ Uložen nový kupón ke schválení: ${cleanCode} (${slevaHodnota ?? ''} ${slevaTyp}) pro ${item.storeKey}`);
             }
           } else {
-            console.log(`   ℹ️ Kupón ${cleanCode} už v databázi existuje.`);
+            console.log(`   ℹ️ Kupón ${cleanCode} (${item.storeKey}) už v databázi existuje, přeskakuji.`);
           }
 
-          if (coupon.platnost_do && (!latestExpiration || coupon.platnost_do > latestExpiration)) {
-            latestExpiration = coupon.platnost_do;
+          if (coupon.plati_do && coupon.plati_do.length === 10 && (!latestExpiration || coupon.plati_do > latestExpiration)) {
+            latestExpiration = coupon.plati_do;
           }
         }
 
-        // Uložíme nový hash a datum kontroly až po úspěšném vyhodnocení AI
+        // Uložíme nový hash a datum kontroly do tabulky obchody_trhy
         await supabase
           .from('obchody_trhy')
           .update({
-            posledni_kontrola_webu: new Date().toISOString(),
+            posledni_kontrola_at: new Date().toISOString(),
             posledni_hash_obsahu: item.currentHash,
-            preskocit_kontrolu_do: latestExpiration
+            preskocit_kontrolu_do: s.pauza_pri_aktivnim_kuponu ? latestExpiration : null
           })
-          .eq('id', s.id);
+          .eq('obchod_id', s.obchod_id)
+          .eq('kod_zeme', s.kod_zeme);
       }
 
-      // Krátká pauza 6 vteřin mezi dávkami, abychom nikdy nepřekročili minutový limit (RPM)
       if (i + BATCH_SIZE < storesForAi.length) {
         await new Promise((r) => setTimeout(r, 6000));
       }
